@@ -191,9 +191,15 @@ public class KThread {
 	Lib.assertTrue(toBeDestroyed == null);
 	toBeDestroyed = currentThread;
 
-
 	currentThread.status = statusFinished;
-	
+
+	// only use nextThread() once for each thread can either join one parent thread or be independent
+	// the behavior of join the second thread is not guaranteed.
+	KThread parentThread = currentThread.waitQueue.nextThread();
+	if (parentThread != null) {
+	    parentThread.ready();
+	}
+
 	sleep();
     }
 
@@ -277,6 +283,18 @@ public class KThread {
 
 	Lib.assertTrue(this != currentThread);
 
+	boolean intStatus = Machine.interrupt().disable();
+
+	if (this.status != statusFinished) {
+		// `this` thread get the resource and no other thread is waiting for this
+	    waitQueue.acquire(this);
+	    // currentThread waits for the resource
+	    waitQueue.waitForAccess(currentThread);
+	    // let currentThread sleeps
+	    sleep();
+	}
+
+	Machine.interrupt().restore(intStatus);;
     }
 
     /**
@@ -431,6 +449,7 @@ public class KThread {
     private String name = "(unnamed thread)";
     private Runnable target;
     private TCB tcb;
+    private ThreadQueue waitQueue = ThreadedKernel.scheduler.newThreadQueue(true);
 
     /**
      * Unique identifer for this thread. Used to deterministically compare
