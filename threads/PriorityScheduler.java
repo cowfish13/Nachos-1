@@ -2,10 +2,11 @@ package nachos.threads;
 
 import nachos.machine.*;
 
+import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.TreeSet;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.ArrayList;
 
 /**
  * A scheduler that chooses threads based on their priorities.
@@ -33,7 +34,7 @@ public class PriorityScheduler extends Scheduler {
      */
     public PriorityScheduler() {
     }
-
+    
     /**
      * Allocate a new priority thread queue.
      *
@@ -48,28 +49,28 @@ public class PriorityScheduler extends Scheduler {
 
     public int getPriority(KThread thread) {
 	Lib.assertTrue(Machine.interrupt().disabled());
-
+		       
 	return getThreadState(thread).getPriority();
     }
 
     public int getEffectivePriority(KThread thread) {
 	Lib.assertTrue(Machine.interrupt().disabled());
-
+		       
 	return getThreadState(thread).getEffectivePriority();
     }
 
     public void setPriority(KThread thread, int priority) {
 	Lib.assertTrue(Machine.interrupt().disabled());
-
+		       
 	Lib.assertTrue(priority >= priorityMinimum &&
-	   priority <= priorityMaximum);
-
+		   priority <= priorityMaximum);
+	
 	getThreadState(thread).setPriority(priority);
     }
 
     public boolean increasePriority() {
 	boolean intStatus = Machine.interrupt().disable();
-
+		       
 	KThread thread = KThread.currentThread();
 
 	int priority = getPriority(thread);
@@ -84,7 +85,7 @@ public class PriorityScheduler extends Scheduler {
 
     public boolean decreasePriority() {
 	boolean intStatus = Machine.interrupt().disable();
-
+		       
 	KThread thread = KThread.currentThread();
 
 	int priority = getPriority(thread);
@@ -108,7 +109,7 @@ public class PriorityScheduler extends Scheduler {
     /**
      * The maximum priority that a thread can have. Do not change this value.
      */
-    public static final int priorityMaximum = 7;    
+    public static final int priorityMaximum = 7;
 
     /**
      * Return the scheduling state of the specified thread.
@@ -135,43 +136,12 @@ public class PriorityScheduler extends Scheduler {
 	    Lib.assertTrue(Machine.interrupt().disabled());
 	    ThreadState threadState = getThreadState(thread);
 	    threadState.waitForAccess(this);
-
-	    /** 
-	     * Add a new thread to the wait queue, so no old effective priority is available
-	     * use 0 can guarantee the safety
-	     */
-	    updateOwnerEffectivePriority(threadState, 0);
 	}
 
 	public void acquire(KThread thread) {
 	    Lib.assertTrue(Machine.interrupt().disabled());
-	    Lib.assertTrue(this.owner == null);
-	    this.owner = thread;
+	    Lib.assertTrue(owner == null);
 	    getThreadState(thread).acquire(this);
-	}
-
-	/**
-	 * Update the effective priority of the owner of this resource due to 
-	 * the change of effective priority of a thread in or a new thread added to the wait queue
-	 * 
-	 * @param	threadState	the state of thread newly added or modified
-	 * @param	oldEffectivePriority	the previous effective priority of that thread
-	 */
-	protected void updateOwnerEffectivePriority(ThreadState threadState, int oldEffectivePriority) {
-	    Lib.assertTrue(Machine.interrupt().disabled());
-
-	    /** priority queue will not rearrange if element changes. Do it manually*/
-	    wQueue.remove(threadState);
-	    wQueue.add(threadState);
-
-	    if (transferPriority && owner != null) {
-		ThreadState ownerState = getThreadState(owner);
-		int highestPriority = pickNextThread().getEffectivePriority();
-		if (ownerState.getEffectivePriority() < oldEffectivePriority)
-		    ownerState.inheritPriority();
-		else if (ownerState.getEffectivePriority() < highestPriority)
-		    ownerState.setEffectivePriority(highestPriority);
-	    }
 	}
 
 	/**
@@ -185,22 +155,19 @@ public class PriorityScheduler extends Scheduler {
 
 	    if (owner != null) {
 		ThreadState oldOwnerState = getThreadState(owner);
-		/** remove current resource(implemented as priority queue from the resouce list of olderOwner)*/
+		/** remove current resource(implemented as priority queue from the resource list of olderOwner)*/
 		oldOwnerState.resources.remove(this);
-		/** as a result of removal, the effective priority might change. Inherit priority again */
-		oldOwnerState.inheritPriority();
+		owner = null;
 	    }
+	    
+	    ThreadState next = pickNextThread();
 
-	    owner = null;
-	    if (wQueue.peek() == null)
-		return owner;
-
-	    ThreadState newOwnerThreadState = wQueue.poll();
-	    owner = newOwnerThreadState.thread;
-	    /** new owner holds `this` resource */
-	    newOwnerThreadState.resources.add(this);
-	    /** now the new owner no longer waits for resources, set its waitQueue to null */
-	    newOwnerThreadState.waitQueue = null;
+	    if (next != null) {
+		pqWaitQueue.remove(next);
+		next.waitQueue = null;
+		next.acquire(this);
+		setDirty();
+	    }
 
 	    return owner;
 	}
@@ -213,7 +180,48 @@ public class PriorityScheduler extends Scheduler {
 	 *		return.
 	 */
 	protected ThreadState pickNextThread() {
-	    return wQueue.peek();
+	    ThreadState nextThreadState = null;
+
+	    for (Iterator<ThreadState> ts = pqWaitQueue.iterator(); ts.hasNext();) {
+		ThreadState state = ts.next();
+		int priority = state.getEffectivePriority();
+
+		if (nextThreadState == null || priority > nextThreadState.getEffectivePriority())
+		    nextThreadState = state;
+	    }
+
+	    return nextThreadState;
+	}
+	
+	public int getEffectivePriority() {
+	    if (transferPriority == false)
+		return priorityMinimum;
+
+	    if (dirty) {
+		effectivePriority = priorityMinimum;
+		long longestInsertTime = Long.MAX_VALUE;
+		for (ThreadState threadState : pqWaitQueue) {
+		    int priority = threadState.getEffectivePriority();
+		    long insertTime = threadState.insertTime;
+		    if (priority > effectivePriority || (priority == effectivePriority && insertTime < longestInsertTime)) {
+			effectivePriority = priority;
+			longestInsertTime = insertTime;
+		    }
+		}
+		dirty = false;
+	    }
+
+	    return effectivePriority;
+	}
+
+	public void setDirty() {
+	    if (transferPriority == false)
+		return;
+
+	    dirty = true;
+
+	    if (owner != null)
+		getThreadState(owner).setDirty();
 	}
 
 	public void print() {
@@ -227,9 +235,21 @@ public class PriorityScheduler extends Scheduler {
 	 */
 	public boolean transferPriority;
 	/** the owner of this priority queue */
-	protected KThread owner;
+	protected KThread owner = null;
+	/** a timer counter of the waiting thread */
+	protected int timeCounter = 0;
+	/** 
+	 * Set to true when a new thread is added to the queue, or
+         * any of the thread in the pqWaitQueue is marked dirty 
+         */
+	protected boolean dirty = false;
+	/**
+	 * The cached highest of the effective priorities in the waitQueue, excluding owner 
+	 * This value is invalidated while dirty is true
+	 */
+	protected int effectivePriority = priorityMinimum;
 	/** core part implementing a priority queue using ThreadState as comparable element */
-	protected java.util.PriorityQueue<ThreadState> wQueue = new java.util.PriorityQueue<ThreadState>();
+	protected LinkedList<ThreadState> pqWaitQueue = new LinkedList<ThreadState>();
     }
 
     /**
@@ -239,7 +259,7 @@ public class PriorityScheduler extends Scheduler {
      *
      * @see	nachos.threads.KThread#schedulingState
      */
-    protected class ThreadState implements Comparable<ThreadState>{
+    protected class ThreadState {
 	/**
 	 * Allocate a new <tt>ThreadState</tt> object and associate it with the
 	 * specified thread.
@@ -251,6 +271,8 @@ public class PriorityScheduler extends Scheduler {
 	    this.resources = new ArrayList<ThreadQueue>();
 	    this.priority = priorityDefault;
 	    this.effectivePriority = priorityDefault;
+	    this.waitQueue = null;
+	    this.dirty = false;
 	}
 
 	/**
@@ -268,6 +290,17 @@ public class PriorityScheduler extends Scheduler {
 	 * @return	the effective priority of the associated thread.
 	 */
 	public int getEffectivePriority() {
+	    if (dirty == false)
+		return effectivePriority;
+
+	    effectivePriority = priority;
+	    for(ThreadQueue queue : resources) {
+		int maxQueueEffective  = ((PriorityQueue)queue).getEffectivePriority();
+		if (effectivePriority < maxQueueEffective)
+		    effectivePriority = maxQueueEffective;
+	    }
+	    dirty = false;
+
 	    return effectivePriority;
 	}
 
@@ -280,42 +313,9 @@ public class PriorityScheduler extends Scheduler {
 	    if (this.priority == priority)
 		return;
 
-	    int oldPriority = this.priority;
 	    this.priority = priority;
-	    
-	    if (this.priority > this.effectivePriority)
-		setEffectivePriority(this.priority);
-	    else if (this.priority < this.effectivePriority && oldPriority == effectivePriority)
-		inheritPriority();
-	}
 
-	/**
-	 * Set the effective priority of the associated thread to the specified value
-	 * 
-	 * @param	effectivePrirority	the new effective priority
-	 */
-	public void setEffectivePriority(int effectivePriority) {
-	    int oldEffectivePriority = effectivePriority;
-	    this.effectivePriority = effectivePriority;
-	    if (waitQueue != null)
-		((PriorityQueue)waitQueue).updateOwnerEffectivePriority(this, oldEffectivePriority);
-	}
-
-	/**
-	 * Pick the largest effective priority out of all resources held by this thread and
-	 * use <tt>setEffectivePrirority()</tt> to set the effective priority
-	 */
-	protected void inheritPriority() {
-	    Lib.assertTrue(Machine.interrupt().disabled());
-	    int maxPriority = getPriority();
-
-	    for (ThreadQueue queue : resources) {
-		ThreadState state = ((PriorityQueue)queue).pickNextThread();
-		if (state != null && state.getEffectivePriority() > maxPriority)
-		    maxPriority = state.getEffectivePriority();
-	    }
-
-	    setEffectivePriority(maxPriority);
+	    setDirty();
 	}
 
 	/**
@@ -332,9 +332,12 @@ public class PriorityScheduler extends Scheduler {
 	 */
 	public void waitForAccess(PriorityQueue waitQueue) {
 	    Lib.assertTrue(Machine.interrupt().disabled());
-	    insertTime = System.currentTimeMillis();
-	    waitQueue.wQueue.add(this);
+	    Lib.assertTrue(this.waitQueue == null);
+	    insertTime = waitQueue.timeCounter;
+	    waitQueue.pqWaitQueue.add(this);
 	    this.waitQueue = waitQueue;
+	    waitQueue.timeCounter++;
+	    waitQueue.setDirty();
 	}
 
 	/**
@@ -349,8 +352,10 @@ public class PriorityScheduler extends Scheduler {
 	 */
 	public void acquire(PriorityQueue waitQueue) {
 	    Lib.assertTrue(Machine.interrupt().disabled());
-	    Lib.assertTrue(waitQueue.wQueue.isEmpty());
+	    Lib.assertTrue(waitQueue.owner == null);
+	    waitQueue.owner = this.thread;
 	    resources.add(waitQueue);
+	    setDirty();
 	}
 
 	/**
@@ -362,26 +367,32 @@ public class PriorityScheduler extends Scheduler {
 	    return insertTime;
 	}
 
-	@Override
-	public int compareTo(ThreadState p) {
-	    if (p.getEffectivePriority() > this.getEffectivePriority()) return 1;
-	    if (p.getEffectivePriority() < this.getEffectivePriority()) return -1;
-	    if (p.getInsertTime() > this.getInsertTime()) return 1;
-	    if (p.getInsertTime() < this.getInsertTime()) return -1;
-	    return 0;
+	public void setDirty() {
+	    if (dirty)
+		return;
+
+	    dirty = true;
+
+	    if (waitQueue != null)
+		((PriorityQueue)waitQueue).setDirty();
 	}
 
-	/** The thread with which this object is associated. */
+	/** The thread with which this object is associated. */	   
 	protected KThread thread;
 	/** The priority of the associated thread. */
 	protected int priority;
 	/** The effective priority of the associated thread. */
 	protected int effectivePriority;
-	/** Collection of PriorityQueues this thread currently holds */
+	/** Collection of PriorityQueues this thread currently holds. Multiple resources are allowed */
 	protected ArrayList<ThreadQueue> resources;
-	/** The resource this is waiting for */
+	/** The resource this is waiting for. A thread can only waits for one resource */
 	protected ThreadQueue waitQueue;
 	/** If multiple threads with the same highest priority are waiting, the scheduler should choose the one that has been waiting in the queue the longest */
 	protected long insertTime;
+	/**
+	 * Set to true when this thread's priority is changed, or 
+	 * when the dirty bit of one of the resources is dirty 
+	 */
+	private boolean dirty;
     }
 }
