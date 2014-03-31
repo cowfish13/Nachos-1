@@ -5,6 +5,9 @@ import nachos.threads.*;
 import nachos.userprog.*;
 
 import java.io.EOFException;
+import java.io.FileDescriptor;
+import java.util.HashMap;
+import java.util.HashSet;
 
 /**
  * Encapsulates the state of a user process that is not contained in its
@@ -132,15 +135,29 @@ public class UserProcess {
 	Lib.assertTrue(offset >= 0 && length >= 0 && offset+length <= data.length);
 
 	byte[] memory = Machine.processor().getMemory();
-	
-	// for now, just assume that virtual addresses equal physical addresses
-	if (vaddr < 0 || vaddr >= memory.length)
-	    return 0;
+	int vpn = Processor.pageFromAddress(vaddr);
+	int ppc = Processor.offsetFromAddress(vaddr);
+	int readBytes = 0;
+	TranslationEntry entry = null;
 
-	int amount = Math.min(length, memory.length-vaddr);
-	System.arraycopy(memory, vaddr, data, offset, amount);
+	while (length > 0) {
+	    if (vpn > numPages) return readBytes;
+	    entry = pageTable[vpn];
+	    if (!entry.valid) return readBytes;
 
-	return amount;
+	    entry.used = true;
+
+	    int paddr = entry.ppn * pageSize + ppc;
+	    int amount = Math.min(pageSize - ppc, length);
+	    System.arraycopy(memory, paddr, data, offset, amount);
+	    vpn++;
+	    length -= amount;
+	    offset += amount;
+	    ppc = 0;
+	    readBytes += amount;
+	}
+
+	return readBytes;
     }
 
     /**
@@ -175,15 +192,38 @@ public class UserProcess {
 	Lib.assertTrue(offset >= 0 && length >= 0 && offset+length <= data.length);
 
 	byte[] memory = Machine.processor().getMemory();
-	
-	// for now, just assume that virtual addresses equal physical addresses
-	if (vaddr < 0 || vaddr >= memory.length)
-	    return 0;
+	int vpn = Processor.pageFromAddress(vaddr);
+	int ppc = Processor.offsetFromAddress(vaddr);
+	int writeBytes = 0;
+	TranslationEntry entry = null;
 
-	int amount = Math.min(length, memory.length-vaddr);
-	System.arraycopy(data, offset, memory, vaddr, amount);
+	while (length > 0) {
+	    if (vpn > numPages)
+		return writeBytes;
 
-	return amount;
+	    entry = pageTable[vpn];
+
+	    if (!entry.valid || entry.readOnly)
+		return writeBytes;
+
+	    entry.used = true;
+	    entry.dirty = true;
+
+	    /* physical address */
+	    int paddr = entry.ppn * pageSize + ppc;
+
+	    /* copy a page at most at a time */
+	    int amount = Math.min((pageSize - ppc), length);
+	    System.arraycopy(data, offset, memory, paddr, amount);
+
+	    vpn++;
+	    length -= amount;
+	    offset += amount;
+	    ppc = 0;
+	    writeBytes += amount;
+	}
+
+	return writeBytes;
     }
 
     /**
@@ -346,6 +386,89 @@ public class UserProcess {
 	return 0;
     }
 
+    private int handleOpen(int nameAddr, boolean create) {
+	/** The maximum length of strings as arguments to system calls is 256 bytes */
+	String name = readVirtualMemoryString(nameAddr, 256);
+	if (null == name) return -1;
+
+	/** find a unused file descriptor to refer to the file*/
+	int fd;
+	for (fd = 0; fd < fileDiscriptors.length; fd++) {
+	    if (fileDiscriptors[fd] == null)
+		break;
+	}
+
+	/** cannot support more than 16 files concurrently */
+	if (fd == fileDiscriptors.length)
+	    return -1;
+
+	// Stub system handles reference count as stated on piazza
+	OpenFile file = UserKernel.fileSystem.open(name, create);
+	if (file == null) return -1;
+
+	fileDiscriptors[fd] = file;
+
+	return fd;
+    }
+
+    private int handleReadWrite(int fd, int bufferAddr, int size, boolean read) {
+	if (fd < 0 || fd > fileDiscriptors.length || size < 0 || bufferAddr < 0 || bufferAddr >= numPages * pageSize)
+	    return -1;
+
+	OpenFile file = fileDiscriptors[fd];
+	if (file == null) return -1;
+
+	if (size == 0) return 0;
+
+	int bytesProcessed = 0;
+
+	// copy by pages. Note that a page of data here may span over two virtual pages
+	for (int vaddr = bufferAddr; vaddr < bufferAddr + size; vaddr += pageSize) {
+	    int vlength = Math.min(pageSize, size - bytesProcessed);
+	    byte[] buf = new byte[vlength];
+	    int readBytes = 0;
+	    int writeBytes = 0;
+	    if (read) {
+		/* Advances the file pointer by this amount */
+		readBytes = file.read(buf, 0, vlength);
+		if (readBytes == -1) return -1;
+		writeBytes = writeVirtualMemory(vaddr, buf, 0, readBytes);
+		if (writeBytes != readBytes) return -1;
+		bytesProcessed += readBytes;
+	    } else {
+		readBytes = readVirtualMemory(vaddr, buf, 0, vlength);
+		if (readBytes == -1) return -1;
+		writeBytes = file.write(buf, 0, readBytes);
+		if (writeBytes != readBytes) return -1;
+		bytesProcessed += writeBytes;
+	    }
+        }
+
+	return bytesProcessed;
+    }
+    
+    private int handleClose(int fd) {
+	if (fd < 0 || fd > fileDiscriptors.length) return -1;
+
+	OpenFile file = fileDiscriptors[fd];
+
+	if (file == null) return -1;
+	file.close();
+	
+	fileDiscriptors[fd] = null;
+
+	return 0;
+    }
+    
+    private int handleUnlink(int nameAddr) {
+	String fileName = readVirtualMemoryString(nameAddr, 256);
+	if (fileName == null) return -1;
+
+	if (UserKernel.fileSystem.remove(fileName))
+	    return 0;
+
+	return -1;
+    }
 
     private static final int
         syscallHalt = 0,
@@ -391,7 +514,18 @@ public class UserProcess {
 	switch (syscall) {
 	case syscallHalt:
 	    return handleHalt();
-
+	case syscallCreate:
+	    return handleOpen(a0, true);
+	case syscallOpen:
+	    return handleOpen(a0, false);
+	case syscallRead:
+	    return handleReadWrite(a0, a1, a2, true);
+	case syscallWrite:
+	    return handleReadWrite(a0, a1, a2, false);
+	case syscallClose:
+	    return handleClose(a0);
+	case syscallUnlink:
+	    return handleUnlink(a0);
 
 	default:
 	    Lib.debug(dbgProcess, "Unknown syscall " + syscall);
@@ -443,7 +577,14 @@ public class UserProcess {
     
     private int initialPC, initialSP;
     private int argc, argv;
-	
+
     private static final int pageSize = Processor.pageSize;
     private static final char dbgProcess = 'a';
+
+    private OpenFile[] fileDiscriptors = new OpenFile[16];
+
+    // private static HashMap<String, Integer> referencesCount = new HashMap<String, Integer>();
+    /** if a file is opened by A and unlinked by B, put it here */
+    // private static HashSet<String> unlinkedFileNames = new HashSet<String>();
+    // private static Lock referenceLock = new Lock();
 }
