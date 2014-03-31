@@ -30,8 +30,17 @@ public class UserProcess {
 	pageTable = new TranslationEntry[numPhysPages];
 	for (int i=0; i<numPhysPages; i++)
 	    pageTable[i] = new TranslationEntry(i,i, true,false,false,false);
+
+	/* stdin */
+	fileDiscriptors[0] = UserKernel.console.openForReading();
+	/* stdout */
+	fileDiscriptors[1] = UserKernel.console.openForWriting();
+	
+	pidLock.acquire();
+	pid = nextPid++;
+	pidLock.release();
     }
-    
+
     /**
      * Allocate and return a new process of the correct class. The class name
      * is specified by the <tt>nachos.conf</tt> key
@@ -580,6 +589,10 @@ public class UserProcess {
 
     private static final int pageSize = Processor.pageSize;
     private static final char dbgProcess = 'a';
+    
+    private int pid;
+    private static int nextPid = 1;
+    private Lock pidLock = new Lock();
 
     private OpenFile[] fileDiscriptors = new OpenFile[16];
 
