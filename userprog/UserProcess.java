@@ -35,7 +35,7 @@ public class UserProcess {
 	fileDiscriptors[0] = UserKernel.console.openForReading();
 	/* stdout */
 	fileDiscriptors[1] = UserKernel.console.openForWriting();
-	
+
 	pidLock.acquire();
 	pid = nextPid++;
 	pidLock.release();
@@ -389,8 +389,11 @@ public class UserProcess {
      */
     private int handleHalt() {
 
+	if (pid != 1)
+	    return 0;
+
 	Machine.halt();
-	
+
 	Lib.assertNotReached("Machine.halt() did not halt machine!");
 	return 0;
     }
