@@ -1,5 +1,7 @@
 package nachos.userprog;
 
+import java.util.LinkedList;
+
 import nachos.machine.*;
 import nachos.threads.*;
 import nachos.userprog.*;
@@ -23,10 +25,46 @@ public class UserKernel extends ThreadedKernel {
 	super.initialize(args);
 
 	console = new SynchConsole(Machine.console());
-	
+	memoryLock = new Lock();
+	freePhysicalPages = new LinkedList<Integer>();
+
 	Machine.processor().setExceptionHandler(new Runnable() {
 		public void run() { exceptionHandler(); }
 	    });
+	
+	int ppn = Machine.processor().getNumPhysPages();
+	
+	for(int i  = 0; i < ppn; i++) {
+	    freePhysicalPages.add(i);
+	}
+    }
+    
+    public static LinkedList<Integer> getFreePhysicalPages(int numPages) {
+	memoryLock.acquire();
+	LinkedList<Integer> memoryPages = new LinkedList<Integer>();
+	for(int i = 0; i < numPages; i++) {
+	    if (freePhysicalPages.size() != 0) {
+		int ppn = freePhysicalPages.remove(0);
+		memoryPages.add(ppn);
+	    } else {
+		break;
+	    }
+	}
+
+	if (memoryPages.size() != numPages) {
+	    freePhysicalPages.addAll(memoryPages);
+	    memoryPages = null;
+	}
+
+	memoryLock.release();
+
+	return memoryPages;
+    }
+
+    public static void releasePhysicalPages(LinkedList<Integer> memoryPages) {
+	memoryLock.acquire();
+	freePhysicalPages.addAll(memoryPages);
+	memoryLock.release();
     }
 
     /**
@@ -112,4 +150,10 @@ public class UserKernel extends ThreadedKernel {
 
     // dummy variables to make javac smarter
     private static Coff dummy1 = null;
+
+    /** Global free physical memory page pool */
+    private static LinkedList<Integer> freePhysicalPages = null;
+
+    /** Globally accessible lock that guarantees physical memory page synchronization */
+    private static Lock memoryLock = null;
 }
