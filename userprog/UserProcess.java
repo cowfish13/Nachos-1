@@ -8,6 +8,8 @@ import java.io.EOFException;
 import java.io.FileDescriptor;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Encapsulates the state of a user process that is not contained in its
@@ -28,17 +30,18 @@ public class UserProcess {
     public UserProcess() {
 	int numPhysPages = Machine.processor().getNumPhysPages();
 	pageTable = new TranslationEntry[numPhysPages];
-	for (int i=0; i<numPhysPages; i++)
-	    pageTable[i] = new TranslationEntry(i,i, true,false,false,false);
+	childrenProcess = new HashMap<Integer, UserProcess>();
+	processesExitStatus = new HashMap<Integer, Integer>();
+	processesWithUnhandledException = new HashSet<Integer>();
 
 	/* stdin */
 	fileDiscriptors[0] = UserKernel.console.openForReading();
 	/* stdout */
 	fileDiscriptors[1] = UserKernel.console.openForWriting();
 
-	pidLock.acquire();
+	processLock.acquire();
 	pid = nextPid++;
-	pidLock.release();
+	processLock.release();
     }
 
     /**
@@ -63,8 +66,13 @@ public class UserProcess {
     public boolean execute(String name, String[] args) {
 	if (!load(name, args))
 	    return false;
-	
-	new UThread(this).setName(name).fork();
+
+	processLock.acquire();
+	numOfRunningProcesses++;
+	processLock.release();
+
+	thread = (UThread) new UThread(this).setName(name);
+	thread.fork();
 
 	return true;
     }
@@ -337,6 +345,18 @@ public class UserProcess {
 	    return false;
 	}
 
+	LinkedList<Integer> memoryPages = UserKernel.getFreePhysicalPages(numPages);
+	if (memoryPages == null) {
+	    coff.close();
+	    return false;
+	}
+
+	pageTable = new TranslationEntry[numPages];
+	for(int i = 0; i < numPages; i++) {
+	    int ppn = memoryPages.pollFirst();
+	    pageTable[i] = new TranslationEntry(i, ppn, true, false, false, false);
+	}
+
 	// load sections
 	for (int s=0; s<coff.getNumSections(); s++) {
 	    CoffSection section = coff.getSection(s);
@@ -346,12 +366,11 @@ public class UserProcess {
 
 	    for (int i=0; i<section.getLength(); i++) {
 		int vpn = section.getFirstVPN()+i;
-
-		// for now, just assume virtual addresses=physical addresses
-		section.loadPage(i, vpn);
+		section.loadPage(i, pageTable[vpn].ppn);
+		pageTable[vpn].readOnly = section.isReadOnly();
 	    }
 	}
-	
+
 	return true;
     }
 
@@ -359,7 +378,17 @@ public class UserProcess {
      * Release any resources allocated by <tt>loadSections()</tt>.
      */
     protected void unloadSections() {
-    }    
+	LinkedList<Integer> ppnPages = new LinkedList<Integer>();
+	for (int i = 0; i < numPages; i++) {
+	    if (pageTable[i] != null && pageTable[i].valid) {
+		ppnPages.add(pageTable[i].ppn);
+		pageTable[i].valid = false;
+		pageTable[i].ppn = -1;
+	    }
+	}
+	UserKernel.releasePhysicalPages(ppnPages);
+	coff.close();
+    }
 
     /**
      * Initialize the processor's registers in preparation for running the
@@ -482,6 +511,79 @@ public class UserProcess {
 	return -1;
     }
 
+    private int handleExec(int nameAddr, int argc, int argvAddr) {
+	if (argc < 0) return -1;
+	String name = readVirtualMemoryString(nameAddr, 256);
+	if (name == null || !name.toLowerCase().endsWith(".coff")) return -1;
+
+	String[] args = new String[argc];
+	byte[] argAddrBytes = new byte[4];
+
+	for (int i = 0; i < argc; i++) {
+	    if (readVirtualMemory(argvAddr + 4 * i, argAddrBytes) != 4)
+		return -1;
+	    int argAddr = Lib.bytesToInt(argAddrBytes, 0);
+	    String arg = readVirtualMemoryString(argAddr, 256);
+	    if (arg == null) return -1;
+	    args[i] = arg;
+	}
+
+	UserProcess child = UserProcess.newUserProcess();
+	child.setParentProcess(this);
+	if (child == null || !child.execute(name, args)) return -1;
+	int childPID = child.getProcessID();
+	childrenProcess.put(childPID, child);
+
+	return childPID;
+    }
+
+    private int handleJoin(int processID, int statusAddr) {
+	UserProcess childProcess = childrenProcess.get(processID);
+
+	if (childProcess == null || childProcess.getThread() != null)
+	    return -1;
+
+	childProcess.getThread().join();
+
+	if (!processesExitStatus.containsKey(pid))
+	    return -1;
+	int childStatus = processesExitStatus.get(pid);
+
+	if (writeVirtualMemory(statusAddr, Lib.bytesFromInt(childStatus)) != 4)
+	    return -1;
+
+	childrenProcess.remove(pid);
+
+	if (processesWithUnhandledException.contains(pid))
+	    return 0;
+
+	return 1;
+    }
+    
+    private int handleExit(int status) {
+	for (int childPID : childrenProcess.keySet())
+	    childrenProcess.get(childPID).setParentProcess(null);
+
+	childrenProcess.clear();
+	unloadSections();
+	for (int fd = 0; fd < fileDiscriptors.length; fd++)
+	    handleClose(fd);
+
+	processLock.acquire();
+	numOfRunningProcesses--;
+	if (numOfRunningProcesses == 0)
+	processesExitStatus.put(pid, status);
+	if (numOfRunningProcesses == 0)
+	    Kernel.kernel.terminate();
+	processLock.release();
+
+	KThread.finish();
+
+	Lib.assertNotReached("KThread.finish() did not make the thread of the process sleep");
+
+	return 0;
+    }
+
     private static final int
         syscallHalt = 0,
 	syscallExit = 1,
@@ -538,10 +640,18 @@ public class UserProcess {
 	    return handleClose(a0);
 	case syscallUnlink:
 	    return handleUnlink(a0);
+	case syscallExec:
+	    return handleExec(a0, a1, a2);
+	case syscallJoin:
+	    return handleJoin(a0, a1);
+	case syscallExit:
+	    return handleExit(a0);
 
 	default:
 	    Lib.debug(dbgProcess, "Unknown syscall " + syscall);
-	    Lib.assertNotReached("Unknown system call!");
+	    processesWithUnhandledException.add(pid);
+	    //Lib.assertNotReached("Unknown system call!");
+	    handleExit(-1);
 	}
 	return 0;
     }
@@ -576,7 +686,23 @@ public class UserProcess {
 	}
     }
 
-    /** The program being run by this process. */
+    public int getProcessID() {
+	return pid;
+    }
+
+    public UThread getThread() {
+	return thread;
+    }
+
+    public UserProcess getParentProcess() {
+	return parentProcess;
+}
+
+    public void setParentProcess(UserProcess parentProcess) {
+	this.parentProcess = parentProcess;
+    }
+
+/** The program being run by this process. */
     protected Coff coff;
 
     /** This process's page table. */
@@ -586,21 +712,24 @@ public class UserProcess {
 
     /** The number of pages in the program's stack. */
     protected final int stackPages = 8;
-    
+
     private int initialPC, initialSP;
     private int argc, argv;
 
     private static final int pageSize = Processor.pageSize;
     private static final char dbgProcess = 'a';
-    
+
     private int pid;
     private static int nextPid = 1;
-    private Lock pidLock = new Lock();
+    private static int numOfRunningProcesses = 0;
+    private static Lock processLock = new Lock();
+    private UThread thread;
 
     private OpenFile[] fileDiscriptors = new OpenFile[16];
 
-    // private static HashMap<String, Integer> referencesCount = new HashMap<String, Integer>();
-    /** if a file is opened by A and unlinked by B, put it here */
-    // private static HashSet<String> unlinkedFileNames = new HashSet<String>();
-    // private static Lock referenceLock = new Lock();
+    /** Should i use ConcurrentHashMap?? */
+    private HashMap<Integer, UserProcess> childrenProcess;
+    private UserProcess parentProcess = null;
+    private static HashMap<Integer, Integer> processesExitStatus;
+    private HashSet<Integer> processesWithUnhandledException;
 }
